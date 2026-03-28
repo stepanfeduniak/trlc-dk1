@@ -71,3 +71,35 @@ class MITControllerConfig(DK1ControllerConfig):
     joint_4: JointParams = field(default_factory=lambda: MITControllerConfig.JointParams(kp=40.0, kd=1.5))
     joint_5: JointParams = field(default_factory=lambda: MITControllerConfig.JointParams(kp=10.0, kd=1.5))
     joint_6: JointParams = field(default_factory=lambda: MITControllerConfig.JointParams(kp=10.0, kd=1.5))
+
+
+@DK1ControllerConfig.register_subclass("mit_h")
+@dataclass
+class MITHControllerConfig(DK1ControllerConfig):
+    """Hierarchical MIT controller: background servo loop with exponential smoothing.
+
+    Runs a fixed-frequency inner loop that interpolates toward target positions
+    using first-order low-pass filtering, then sends MIT impedance commands.
+    Decouples slow/variable command rates from fast motor updates.
+    """
+
+    @dataclass
+    class JointParams:
+        """Per-joint MIT gains (kp/kd) — same semantics as MITControllerConfig."""
+        kp: float = 50.0
+        kd: float = 3.0
+
+    # MIT gains (identical defaults to MITControllerConfig)
+    joint_1: JointParams = field(default_factory=lambda: MITHControllerConfig.JointParams(kp=80.0, kd=5.0))
+    joint_2: JointParams = field(default_factory=lambda: MITHControllerConfig.JointParams(kp=80.0, kd=5.0))
+    joint_3: JointParams = field(default_factory=lambda: MITHControllerConfig.JointParams(kp=80.0, kd=5.0))
+    joint_4: JointParams = field(default_factory=lambda: MITHControllerConfig.JointParams(kp=40.0, kd=1.5))
+    joint_5: JointParams = field(default_factory=lambda: MITHControllerConfig.JointParams(kp=10.0, kd=1.5))
+    joint_6: JointParams = field(default_factory=lambda: MITHControllerConfig.JointParams(kp=10.0, kd=1.5))
+
+    # Servo loop parameters
+    servo_rate_hz: float = 200.0
+    smoothing_max: float = 0.15        # alpha when commands flow at expected rate
+    smoothing_min: float = 0.02        # alpha after a long gap (packet loss)
+    expected_dt_s: float = 0.04        # expected interval between commands (~25Hz)
+    gripper_smoothing_factor: float = 0.2

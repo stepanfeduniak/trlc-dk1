@@ -14,7 +14,9 @@
 
 from dataclasses import dataclass, field
 from functools import cached_property
+import math
 import serial
+import threading
 import time
 import logging
 from typing import Any
@@ -29,6 +31,7 @@ from lerobot_robot_trlc_dk1.controller_configs import (
     PosVelControllerConfig,
     TorquePosControllerConfig,
     MITControllerConfig,
+    MITHControllerConfig,
 )
 from lerobot_robot_trlc_dk1.motors.DM_Control_Python.DM_CAN import *
 
@@ -37,6 +40,18 @@ logger = logging.getLogger(__name__)
 
 def map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+
+def _precise_sleep(duration: float) -> None:
+    """Sleep with busy-wait tail for sub-ms accuracy."""
+    if duration <= 0:
+        return
+    end = time.perf_counter() + duration
+    remaining = duration - 0.001
+    if remaining > 0:
+        time.sleep(remaining)
+    while time.perf_counter() < end:
+        pass
 
 
 @RobotConfig.register_subclass("dk1_follower")
@@ -94,6 +109,15 @@ class DK1Follower(Robot):
 
         self.cameras = make_cameras_from_configs(config.cameras)
 
+        # Servo loop state (active only for mit_h controller)
+        self._servo_lock = threading.Lock()
+        self._target_positions: dict[str, float] | None = None
+        self._current_positions: dict[str, float] | None = None
+        self._servo_thread: threading.Thread | None = None
+        self._servo_running = False
+        self._last_command_time: float = 0.0
+        self._alpha: float = 0.02  # current smoothing factor, set by send_action()
+
     @property
     def _motors_ft(self) -> dict[str, type]:
         return {f"{motor}.pos": float for motor in self.motors}
@@ -131,6 +155,14 @@ class DK1Follower(Robot):
         for cam in self.cameras.values():
             cam.connect()
 
+        if self._is_mit_h:
+            self._servo_running = True
+            self._servo_thread = threading.Thread(
+                target=self._servo_loop, daemon=True, name="dk1-servo",
+            )
+            self._servo_thread.start()
+            logger.info("Servo loop started at %.0f Hz", self.config.joint_controller.servo_rate_hz)
+
     @property
     def is_calibrated(self) -> bool:
         return True
@@ -138,10 +170,14 @@ class DK1Follower(Robot):
     def calibrate(self) -> None:
         pass
 
+    @property
+    def _is_mit_h(self) -> bool:
+        return isinstance(self.config.joint_controller, MITHControllerConfig)
+
     def configure(self) -> None:
 
         jc = self.config.joint_controller
-        is_mit = isinstance(jc, MITControllerConfig)
+        is_mit = isinstance(jc, (MITControllerConfig, MITHControllerConfig))
         arm_control_mode = Control_Type.MIT if is_mit else Control_Type.POS_VEL
 
         for key, motor in self.motors.items():
@@ -196,55 +232,106 @@ class DK1Follower(Robot):
         self.control.switchControlMode(
             self.motors["gripper"], Control_Type.Torque_Pos)
 
+    def _servo_loop(self) -> None:
+        """Background loop: interpolate toward target and send to motors at fixed rate.
+
+        Alpha is set by send_action() based on the interval between commands:
+        short interval (normal flow) → high alpha. Long interval (gap) → low alpha.
+        The servo loop reads self._alpha each cycle and interpolates accordingly.
+        """
+        jc: MITHControllerConfig = self.config.joint_controller
+        period = 1.0 / jc.servo_rate_hz
+        alpha_grip = jc.gripper_smoothing_factor
+
+        # Diagnostics
+        cycle_count = 0
+        log_interval = int(jc.servo_rate_hz)  # log every ~1s
+        window_start = time.perf_counter()
+
+        while self._servo_running:
+            t0 = time.perf_counter()
+
+            try:
+                with self._servo_lock:
+                    if self._target_positions is None or self._current_positions is None:
+                        pass  # No target yet — fall through to rate-limit sleep
+                    else:
+                        alpha = self._alpha
+
+                        for key in self._current_positions:
+                            a = alpha_grip if key == "gripper" else alpha
+                            self._current_positions[key] += a * (
+                                self._target_positions[key] - self._current_positions[key]
+                            )
+
+                        self._send_to_motors(self._current_positions)
+
+                        cycle_count += 1
+                        if cycle_count >= log_interval:
+                            now = time.perf_counter()
+                            hz = cycle_count / max(1e-9, now - window_start)
+                            logger.debug("servo loop: %.0f Hz  alpha=%.3f", hz, alpha)
+                            cycle_count = 0
+                            window_start = now
+            except Exception:
+                logger.error("servo loop error", exc_info=True)
+
+            # Rate-limit: busy-wait for the remainder of the period
+            elapsed = time.perf_counter() - t0
+            remaining = period - elapsed
+            if remaining > 0:
+                _precise_sleep(remaining)
+
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        # Read arm position
         start = time.perf_counter()
 
         obs_dict = {}
-        for key, motor in self.motors.items():
-            self.control.refresh_motor_status(motor)
-            if key == "gripper":
-                # Normalize gripper position between 1 (closed) and 0 (open)
-                obs_dict[f"{key}.pos"] = map_range(
-                    motor.getPosition(), self.gripper_open_pos, self.gripper_closed_pos, 0.0, 1.0)
-            else:
-                obs_dict[f"{key}.pos"] = motor.getPosition()
+        # Synchronize with servo thread when it owns the serial bus
+        with self._servo_lock:
+            for key, motor in self.motors.items():
+                self.control.refresh_motor_status(motor)
+                if key == "gripper":
+                    obs_dict[f"{key}.pos"] = map_range(
+                        motor.getPosition(), self.gripper_open_pos, self.gripper_closed_pos, 0.0, 1.0)
+                else:
+                    obs_dict[f"{key}.pos"] = motor.getPosition()
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
-        # Capture images from cameras
+        # Capture images outside the lock (no serial contention)
         for cam_key, cam in self.cameras.items():
             obs_dict[cam_key] = cam.async_read()
 
         return obs_dict
 
-    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
-        goal_pos = {key.removesuffix(
-            ".pos"): val for key, val in action.items() if key.endswith(".pos")}
-
-        # Send goal position to the arm
+    def _send_to_motors(self, goal_pos: dict[str, float]) -> None:
+        """Write goal positions to all motors. Must be called with _servo_lock held (or from single thread)."""
         for key, motor in self.motors.items():
             if key == "gripper":
                 self.control.refresh_motor_status(motor)
-                gripper_goal_pos_mapped = map_range(goal_pos[key], 0.0, 1.0, self.gripper_open_pos, self.gripper_closed_pos)
-                self.control.control_pos_force(motor, gripper_goal_pos_mapped, self.DM4310_SPEED*self.EMIT_VELOCITY_SCALE,
-                                               i_des=self.config.max_gripper_torque/self.DM4310_TORQUE_CONSTANT*self.EMIT_CURRENT_SCALE)
+                gripper_goal_pos_mapped = map_range(
+                    goal_pos[key], 0.0, 1.0, self.gripper_open_pos, self.gripper_closed_pos,
+                )
+                self.control.control_pos_force(
+                    motor, gripper_goal_pos_mapped,
+                    self.DM4310_SPEED * self.EMIT_VELOCITY_SCALE,
+                    i_des=self.config.max_gripper_torque / self.DM4310_TORQUE_CONSTANT * self.EMIT_CURRENT_SCALE,
+                )
             else:
+                pos = goal_pos[key]
                 if key in self.JOINT_LIMITS:
-                    goal_pos[key] = np.clip(goal_pos[key], self.JOINT_LIMITS[key][0], self.JOINT_LIMITS[key][1])
+                    pos = np.clip(pos, self.JOINT_LIMITS[key][0], self.JOINT_LIMITS[key][1])
 
                 jc = self.config.joint_controller
-                if isinstance(jc, MITControllerConfig):
+                if isinstance(jc, (MITControllerConfig, MITHControllerConfig)):
                     jp = getattr(jc, key)
-                    self.control.controlMIT(
-                        motor, jp.kp, jp.kd, goal_pos[key], dq=0.0, tau=0.0)
+                    kp = jp["kp"] if isinstance(jp, dict) else jp.kp
+                    kd = jp["kd"] if isinstance(jp, dict) else jp.kd
+                    self.control.controlMIT(motor, kp, kd, pos, dq=0.0, tau=0.0)
                 else:
                     max_speed = (
                         self.DM4310_SPEED
@@ -252,13 +339,47 @@ class DK1Follower(Robot):
                         else self.DM4340_SPEED
                     )
                     self.control.control_Pos_Vel(
-                        motor, goal_pos[key], self.config.joint_velocity_scaling * max_speed)
+                        motor, pos, self.config.joint_velocity_scaling * max_speed,
+                    )
+
+    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+
+        if self._is_mit_h:
+            # Non-blocking: update target for servo thread
+            now = time.perf_counter()
+            with self._servo_lock:
+                if self._current_positions is None:
+                    self._current_positions = dict(goal_pos)
+                self._target_positions = goal_pos
+
+                # Adaptive alpha from inter-command interval
+                jc: MITHControllerConfig = self.config.joint_controller
+                if self._last_command_time > 0:
+                    cmd_dt = now - self._last_command_time
+                    # exp(-dt/expected_dt): 1.0 at expected rate, decays for longer gaps
+                    t = math.exp(-cmd_dt / jc.expected_dt_s)
+                    self._alpha = jc.smoothing_min + (jc.smoothing_max - jc.smoothing_min) * t
+                else:
+                    self._alpha = jc.smoothing_max
+                self._last_command_time = now
+        else:
+            self._send_to_motors(goal_pos)
 
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
 
     def disconnect(self):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        # Stop servo thread before touching serial
+        self._servo_running = False
+        if self._servo_thread is not None:
+            self._servo_thread.join(timeout=2.0)
+            self._servo_thread = None
 
         if self.config.disable_torque_on_disconnect:
             for motor in self.motors.values():
