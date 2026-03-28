@@ -71,3 +71,35 @@ class MITControllerConfig(DK1ControllerConfig):
     joint_4: JointParams = field(default_factory=lambda: MITControllerConfig.JointParams(kp=40.0, kd=1.5))
     joint_5: JointParams = field(default_factory=lambda: MITControllerConfig.JointParams(kp=10.0, kd=1.5))
     joint_6: JointParams = field(default_factory=lambda: MITControllerConfig.JointParams(kp=10.0, kd=1.5))
+
+
+@DK1ControllerConfig.register_subclass("mit_a")
+@dataclass
+class MITAdaptiveControllerConfig(DK1ControllerConfig):
+    """Adaptive MIT impedance controller: kp/kd scale with command freshness.
+
+    Gains scale down when the inter-command interval is large (packet loss),
+    making the robot compliant and preventing jerky jumps. When commands
+    resume at normal rate, full stiffness is restored.
+
+    Effective gains: kp_eff = kp * scale,  kd_eff = kd * scale
+    where scale = min_scale + (1 - min_scale) * exp(-cmd_dt / expected_dt_s)
+    """
+
+    @dataclass
+    class JointParams:
+        """Per-joint MIT gains (kp/kd) — base values at full stiffness."""
+        kp: float = 50.0
+        kd: float = 3.0
+
+    # Base MIT gains (identical defaults to MITControllerConfig)
+    joint_1: JointParams = field(default_factory=lambda: MITAdaptiveControllerConfig.JointParams(kp=80.0, kd=5.0))
+    joint_2: JointParams = field(default_factory=lambda: MITAdaptiveControllerConfig.JointParams(kp=80.0, kd=5.0))
+    joint_3: JointParams = field(default_factory=lambda: MITAdaptiveControllerConfig.JointParams(kp=80.0, kd=5.0))
+    joint_4: JointParams = field(default_factory=lambda: MITAdaptiveControllerConfig.JointParams(kp=40.0, kd=1.5))
+    joint_5: JointParams = field(default_factory=lambda: MITAdaptiveControllerConfig.JointParams(kp=10.0, kd=1.5))
+    joint_6: JointParams = field(default_factory=lambda: MITAdaptiveControllerConfig.JointParams(kp=10.0, kd=1.5))
+
+    # Adaptive parameters
+    min_scale: float = 0.15            # minimum gain multiplier (15% of base)
+    expected_dt_s: float = 0.04        # expected command interval (~25Hz)

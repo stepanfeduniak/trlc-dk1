@@ -14,6 +14,7 @@
 
 from dataclasses import dataclass, field
 from functools import cached_property
+import math
 import serial
 import time
 import logging
@@ -29,6 +30,7 @@ from lerobot_robot_trlc_dk1.controller_configs import (
     PosVelControllerConfig,
     TorquePosControllerConfig,
     MITControllerConfig,
+    MITAdaptiveControllerConfig,
 )
 from lerobot_robot_trlc_dk1.motors.DM_Control_Python.DM_CAN import *
 
@@ -94,6 +96,10 @@ class DK1Follower(Robot):
 
         self.cameras = make_cameras_from_configs(config.cameras)
 
+        # Adaptive impedance state (active only for mit_a controller)
+        self._last_command_time: float = 0.0
+        self._gain_scale: float = 1.0
+
     @property
     def _motors_ft(self) -> dict[str, type]:
         return {f"{motor}.pos": float for motor in self.motors}
@@ -141,7 +147,7 @@ class DK1Follower(Robot):
     def configure(self) -> None:
 
         jc = self.config.joint_controller
-        is_mit = isinstance(jc, MITControllerConfig)
+        is_mit = isinstance(jc, (MITControllerConfig, MITAdaptiveControllerConfig))
         arm_control_mode = Control_Type.MIT if is_mit else Control_Type.POS_VEL
 
         for key, motor in self.motors.items():
@@ -229,6 +235,18 @@ class DK1Follower(Robot):
         goal_pos = {key.removesuffix(
             ".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
+        jc = self.config.joint_controller
+
+        # Adaptive impedance: compute gain scale from inter-command interval
+        if isinstance(jc, MITAdaptiveControllerConfig):
+            now = time.perf_counter()
+            if self._last_command_time > 0:
+                cmd_dt = now - self._last_command_time
+                expected = jc.expected_dt_s if isinstance(jc.expected_dt_s, float) else float(jc.expected_dt_s)
+                min_s = jc.min_scale if isinstance(jc.min_scale, float) else float(jc.min_scale)
+                self._gain_scale = min_s + (1.0 - min_s) * math.exp(-cmd_dt / expected)
+            self._last_command_time = now
+
         # Send goal position to the arm
         for key, motor in self.motors.items():
             if key == "gripper":
@@ -240,11 +258,15 @@ class DK1Follower(Robot):
                 if key in self.JOINT_LIMITS:
                     goal_pos[key] = np.clip(goal_pos[key], self.JOINT_LIMITS[key][0], self.JOINT_LIMITS[key][1])
 
-                jc = self.config.joint_controller
-                if isinstance(jc, MITControllerConfig):
+                if isinstance(jc, (MITControllerConfig, MITAdaptiveControllerConfig)):
                     jp = getattr(jc, key)
+                    kp = jp["kp"] if isinstance(jp, dict) else jp.kp
+                    kd = jp["kd"] if isinstance(jp, dict) else jp.kd
+                    if isinstance(jc, MITAdaptiveControllerConfig):
+                        kp *= self._gain_scale
+                        kd *= self._gain_scale
                     self.control.controlMIT(
-                        motor, jp.kp, jp.kd, goal_pos[key], dq=0.0, tau=0.0)
+                        motor, kp, kd, goal_pos[key], dq=0.0, tau=0.0)
                 else:
                     max_speed = (
                         self.DM4310_SPEED
